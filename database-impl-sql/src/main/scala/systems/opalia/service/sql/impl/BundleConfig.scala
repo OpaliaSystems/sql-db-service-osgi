@@ -1,12 +1,14 @@
 package systems.opalia.service.sql.impl
 
-import com.typesafe.config.Config
+import com.typesafe.config._
 import java.sql.Connection
 import systems.opalia.commons.configuration.ConfigHelper._
 import systems.opalia.commons.configuration.Reader._
 
 
-final class BundleConfig(config: Config) {
+final class BundleConfig() {
+
+  private val config: Config = ConfigFactory.load()
 
   val driver: String = config.as[String]("database.jdbc.driver")
   val url: String = config.as[String]("database.jdbc.connection.url")

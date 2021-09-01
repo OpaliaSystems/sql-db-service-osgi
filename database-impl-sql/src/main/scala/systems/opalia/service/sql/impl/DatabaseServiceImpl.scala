@@ -6,15 +6,12 @@ import scala.concurrent.Await
 import scala.concurrent.duration.Duration
 import systems.opalia.interfaces.database._
 import systems.opalia.interfaces.logging.LoggingService
-import systems.opalia.interfaces.soa.ConfigurationService
-import systems.opalia.interfaces.soa.osgi.ServiceManager
 
 
 @Component(service = Array(classOf[DatabaseService]), immediate = true, property = Array("database=sql"))
 class DatabaseServiceImpl
   extends DatabaseService {
 
-  private val serviceManager: ServiceManager = new ServiceManager()
   private var bootable: DatabaseServiceBootable = _
 
   @Reference
@@ -23,12 +20,9 @@ class DatabaseServiceImpl
   @Activate
   def start(bundleContext: BundleContext): Unit = {
 
-    val configurationService = serviceManager.getService(bundleContext, classOf[ConfigurationService])
-    val config = new BundleConfig(configurationService.getConfiguration)
-
     bootable =
       new DatabaseServiceBootable(
-        config,
+        new BundleConfig(),
         loggingService,
       )
 
@@ -42,11 +36,12 @@ class DatabaseServiceImpl
     bootable.shutdown()
     Await.result(bootable.awaitUp(), Duration.Inf)
 
-    serviceManager.ungetServices(bundleContext)
-
     bootable = null
   }
 
   def withTransaction[T](block: (QueryFactory) => T): T =
     bootable.withTransaction(block)
+
+  def createClosableTransaction(): ClosableTransaction =
+    bootable.createClosableTransaction()
 }

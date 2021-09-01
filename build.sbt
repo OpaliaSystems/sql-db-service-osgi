@@ -9,7 +9,6 @@ val exclusionRules = Seq(
   ExclusionRule("org.scala-lang", "scala-library"),
   ExclusionRule("org.scala-lang", "scala-reflect"),
   ExclusionRule("org.scala-lang", "scala-compiler"),
-  ExclusionRule("com.typesafe", "config"),
   ExclusionRule("systems.opalia", s"interfaces_$mCrossVersion"),
   ExclusionRule("org.osgi", "org.osgi.core"),
   ExclusionRule("org.osgi", "org.osgi.service.component"),
@@ -62,7 +61,6 @@ lazy val `database-impl-sql` =
 
       OsgiKeys.importPackage ++= Seq(
         "scala.*",
-        "com.typesafe.config.*",
         "systems.opalia.interfaces.*"
       ),
 
