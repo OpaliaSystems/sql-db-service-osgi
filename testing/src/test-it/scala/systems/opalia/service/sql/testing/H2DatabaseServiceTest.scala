@@ -1,6 +1,5 @@
 package systems.opalia.service.sql.testing
 
-import com.typesafe.config._
 import java.nio.file.{Files, Paths}
 import java.time.{LocalDate, LocalDateTime, LocalTime}
 import org.scalatest.flatspec._
@@ -10,16 +9,14 @@ import play.api.libs.json.Json
 import scala.collection.JavaConverters._
 import scala.concurrent.Await
 import scala.concurrent.duration.Duration
-import systems.opalia.bootloader.ArtifactNameBuilder._
-import systems.opalia.bootloader.{Bootloader, BootloaderBuilder}
 import systems.opalia.commons.database.converter.BigDecimalConverter._
 import systems.opalia.commons.database.converter.DefaultConverter._
 import systems.opalia.commons.database.converter.NativeTypesConverter._
 import systems.opalia.commons.database.converter.TimeTypesConverter._
-import systems.opalia.commons.io.FileUtils
+import systems.opalia.commons.io.{FileUtils, PropertiesUtils}
 import systems.opalia.commons.json.JsonAstTransformer
 import systems.opalia.interfaces.database._
-import systems.opalia.interfaces.soa.osgi.ServiceManager
+import systems.opalia.launcher.Launcher
 
 
 class H2DatabaseServiceTest
@@ -29,9 +26,8 @@ class H2DatabaseServiceTest
     with Matchers {
 
   val testName = "h2-database-service-test"
-  val serviceManager = new ServiceManager()
 
-  var bootloader: Bootloader = _
+  var launcher: Launcher = _
   var transactional: Transactional = _
 
   override final def beforeAll(): Unit = {
@@ -41,46 +37,27 @@ class H2DatabaseServiceTest
     if (Files.exists(testPath))
       FileUtils.deleteRecursively(testPath)
 
-    val config =
-      ConfigFactory.load(
-        s"$testName.conf",
-        ConfigParseOptions.defaults(),
-        ConfigResolveOptions.defaults().setAllowUnresolved(true)
-      )
-        .resolveWith(ConfigFactory.parseString(
-          s"""
-             |base-path = $testPath
-           """.stripMargin))
+    sys.props("config.file") = s"./testing/src/test-it/resources/$testName.conf"
+    sys.props("base-path") = testPath.toString
 
-    bootloader =
-      BootloaderBuilder.newBootloaderBuilder(config)
-        .withCacheDirectory(testPath.resolve("felix-cache").normalize())
-        .withBundle("systems.opalia" %% "logging-impl-logback" % "1.0.0")
-        .withBundle("systems.opalia" %% "database-impl-sql" % "1.0.0")
-        .withBundle("org.osgi" % "org.osgi.service.log" % "1.5.0")
-        .withBundle("org.osgi" % "org.osgi.util.tracker" % "1.5.2")
-        .withBundle("org.osgi" % "org.osgi.util.promise" % "1.1.1")
-        .withBundle("org.osgi" % "org.osgi.util.function" % "1.1.0")
-        .withBundle("org.osgi" % "org.osgi.util.pushstream" % "1.0.1")
-        .withBundle("org.osgi" % "org.osgi.service.component" % "1.4.0")
-        .withBundle("org.apache.felix" % "org.apache.felix.scr" % "2.1.16")
-        .newBootloader()
+    val properties =
+      PropertiesUtils.read("./testing/src/test-it/resources/boot.properties") +
+        (Launcher.PROPERTY_WORKING_DIRECTORY -> testPath.toString)
 
-    bootloader.setup()
+    launcher = Launcher.newLauncher(properties, useSystemProperties = false)
 
-    Await.result(bootloader.awaitUp(), Duration.Inf)
+    launcher.setup()
 
-    transactional = serviceManager.getServices(bootloader.bundleContext, classOf[DatabaseService], "(database=sql)").asScala.head
+    Await.result(launcher.awaitUp(), Duration.Inf)
+
+    transactional = launcher.serviceManager.getServices(classOf[DatabaseService], "(database=sql)").asScala.head
   }
 
   override final def afterAll(): Unit = {
 
-    serviceManager.unregisterServices()
-    serviceManager.ungetServices(bootloader.bundleContext)
+    launcher.shutdown()
 
-    bootloader.shutdown()
-
-    Await.result(bootloader.awaitDown(), Duration.Inf)
+    Await.result(launcher.awaitDown(), Duration.Inf)
   }
 
   private def executeMultiline(factory: QueryFactory, statements: String): Unit = {

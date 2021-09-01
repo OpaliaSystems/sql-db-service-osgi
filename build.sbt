@@ -2,7 +2,7 @@
 val mScalaVersion = "2.12.13"
 val mInterfacesVersion = "1.0.0"
 val mCommonsVersion = "1.0.0"
-val mBootloaderVersion = "1.0.0"
+val mLauncherVersion = "1.0.0"
 val mCrossVersion = """^(\d+\.\d+)""".r.findFirstIn(mScalaVersion).get
 
 val exclusionRules = Seq(
@@ -38,7 +38,7 @@ lazy val `testing` =
       libraryDependencies ++= Seq(
         "systems.opalia" %% "interfaces" % mInterfacesVersion,
         "systems.opalia" %% "commons" % mCommonsVersion,
-        "systems.opalia" %% "bootloader" % mBootloaderVersion,
+        "systems.opalia" %% "osgi-launcher" % mLauncherVersion,
         "org.scalatest" %% "scalatest" % "3.2.5" % "test"
       )
     )
