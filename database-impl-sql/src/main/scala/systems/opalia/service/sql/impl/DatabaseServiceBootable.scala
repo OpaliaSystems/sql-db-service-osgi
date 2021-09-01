@@ -32,7 +32,7 @@ final class DatabaseServiceBootable(config: BundleConfig,
     val start = System.currentTimeMillis
     val connection = dataSource.getConnection
     val closeables = mutable.ListBuffer[OneTimeCloseable]()
-    val executor = new Executor(logger, connection, useClosableTransaction = false, closeables)
+    val executor = new Executor(logger, connection, useClosableTransaction = false, config.nativeSql, closeables)
 
     val result =
       try {
@@ -73,7 +73,7 @@ final class DatabaseServiceBootable(config: BundleConfig,
     val start = System.currentTimeMillis
     val connection = dataSource.getConnection
     val closeables = mutable.ListBuffer[OneTimeCloseable]()
-    val executor = new Executor(logger, connection, useClosableTransaction = true, closeables)
+    val executor = new Executor(logger, connection, useClosableTransaction = true, config.nativeSql, closeables)
 
     connection.setAutoCommit(false)
 

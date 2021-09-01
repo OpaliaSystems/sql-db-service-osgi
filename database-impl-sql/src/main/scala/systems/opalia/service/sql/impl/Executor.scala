@@ -18,6 +18,7 @@ import systems.opalia.interfaces.logging.Logger
 class Executor(logger: Logger,
                connection: Connection,
                useClosableTransaction: Boolean,
+               useNativeSql: Boolean,
                closeables: mutable.ListBuffer[OneTimeCloseable]) {
 
   def executeAndFetch(statement: String, parameters: Map[String, Any]): Result = {
@@ -50,7 +51,10 @@ class Executor(logger: Logger,
         }
       }
 
-    performQuery(statement, parameters)(f)
+    if (useNativeSql)
+      performNativeQuery(statement, parameters)(f)
+    else
+      performQuery(statement, parameters)(f)
   }
 
   def execute(statement: String, parameters: Map[String, Any]): Unit = {
@@ -61,7 +65,10 @@ class Executor(logger: Logger,
         closeablesLocal.foreach(_.close())
       }
 
-    performQuery(statement, parameters)(f)
+    if (useNativeSql)
+      performNativeQuery(statement, parameters)(f)
+    else
+      performQuery(statement, parameters)(f)
   }
 
   private def performQuery[T](statement: String, parameters: Map[String, Any])
@@ -100,6 +107,41 @@ class Executor(logger: Logger,
 
       if (!useClosableTransaction)
         logger.trace(s"A SQL statement was performed in ${end - start} ms.")
+
+      result
+
+    } finally {
+
+      closeables.appendAll(closeablesLocal.reverse)
+    }
+  }
+
+  private def performNativeQuery[T](statement: String, parameters: Map[String, Any])
+                                   (black: (PreparedStatement, Seq[OneTimeCloseable]) => T): T = {
+
+    val start = System.currentTimeMillis
+    val closeablesLocal = mutable.ListBuffer[OneTimeCloseable]()
+
+    try {
+
+      logger.debug(s"Apply native SQL statement:\n$statement")
+
+      val preparedStatement = connection.prepareStatement(statement)
+
+      closeablesLocal.append(new OneTimeCloseable(preparedStatement))
+
+      val arguments = parameters.toList.map(x => x._1.toInt -> x._2).sortBy(_._1).map(_._2)
+
+      setValues(preparedStatement, arguments)
+
+      preparedStatement.execute()
+
+      val result = black(preparedStatement, closeablesLocal.reverse)
+
+      val end = System.currentTimeMillis
+
+      if (!useClosableTransaction)
+        logger.trace(s"A native SQL statement was performed in ${end - start} ms.")
 
       result
 

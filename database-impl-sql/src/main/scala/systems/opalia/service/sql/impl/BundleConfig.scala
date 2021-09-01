@@ -10,6 +10,8 @@ final class BundleConfig() {
 
   private val config: Config = ConfigFactory.load()
 
+  val nativeSql: Boolean = config.as[Option[Boolean]]("database.jdbc.native-sql").getOrElse(false)
+
   val driver: String = config.as[String]("database.jdbc.driver")
   val url: String = config.as[String]("database.jdbc.connection.url")
 
