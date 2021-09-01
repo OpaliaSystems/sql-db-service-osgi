@@ -1,7 +1,7 @@
 package systems.opalia.service.sql.impl
 
-import java.time.Instant
 import org.apache.commons.dbcp2.BasicDataSource
+import scala.collection.mutable
 import systems.opalia.interfaces.database._
 import systems.opalia.interfaces.logging.LoggingService
 import systems.opalia.interfaces.module.Bootable
@@ -13,7 +13,6 @@ final class DatabaseServiceBootable(config: BundleConfig,
     with Bootable[Unit, Unit] {
 
   private val logger = loggingService.newLogger(classOf[DatabaseService].getName)
-
   private val dataSource = new BasicDataSource()
 
   dataSource.setDriverClassName(config.driver)
@@ -30,9 +29,10 @@ final class DatabaseServiceBootable(config: BundleConfig,
 
   def withTransaction[T](block: (QueryFactory) => T): T = {
 
+    val start = System.currentTimeMillis
     val connection = dataSource.getConnection
-    val start = Instant.now.toEpochMilli
-    val executor = new Executor(logger, connection)
+    val closeables = mutable.ListBuffer[OneTimeCloseable]()
+    val executor = new Executor(logger, connection, useClosableTransaction = false, closeables)
 
     val result =
       try {
@@ -41,6 +41,7 @@ final class DatabaseServiceBootable(config: BundleConfig,
 
         val result = block(executor.newQueryFactory())
 
+        closeResources(closeables)
         connection.commit()
 
         result
@@ -49,6 +50,7 @@ final class DatabaseServiceBootable(config: BundleConfig,
 
         case e: Throwable => {
 
+          closeResources(closeables)
           connection.rollback()
 
           throw e
@@ -59,11 +61,69 @@ final class DatabaseServiceBootable(config: BundleConfig,
         connection.close()
       }
 
-    val end = Instant.now.toEpochMilli
+    val end = System.currentTimeMillis
 
     logger.trace(s"A transaction was performed in ${end - start} ms.")
 
     result
+  }
+
+  def createClosableTransaction(): ClosableTransaction = {
+
+    val start = System.currentTimeMillis
+    val connection = dataSource.getConnection
+    val closeables = mutable.ListBuffer[OneTimeCloseable]()
+    val executor = new Executor(logger, connection, useClosableTransaction = true, closeables)
+
+    connection.setAutoCommit(false)
+
+    new ClosableTransaction {
+
+      def queryFactory: QueryFactory =
+        executor.newQueryFactory()
+
+      def close(): Unit = {
+
+        try {
+
+          closeResources(closeables)
+          connection.commit()
+
+        } finally {
+
+          connection.close()
+        }
+
+        val end = System.currentTimeMillis
+
+        logger.trace(s"A closable transaction was performed in ${end - start} ms.")
+      }
+
+      def close(cause: Exception): Unit = {
+
+        try {
+
+          closeResources(closeables)
+          connection.rollback()
+
+        } finally {
+
+          connection.close()
+        }
+
+        throw cause
+      }
+    }
+  }
+
+  private def closeResources(closeables: mutable.ListBuffer[OneTimeCloseable]): Unit = {
+
+    closeables.toList.foreach {
+      closeable =>
+
+        closeable.close()
+        closeables -= closeable
+    }
   }
 
   protected def setupTask(): Unit = {

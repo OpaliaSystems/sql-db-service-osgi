@@ -1,137 +1,111 @@
 package systems.opalia.service.sql.impl
 
-import java.sql.{Connection, JDBCType, PreparedStatement}
+import java.sql.{Connection, JDBCType, PreparedStatement, ResultSet}
 import java.time.{LocalDate, LocalDateTime, LocalTime}
 import org.jooq
 import org.jooq.impl.DSL
 import scala.collection.JavaConverters._
 import scala.collection.immutable.ListMap
 import scala.collection.mutable
-import scala.reflect._
 import scala.util.{Failure, Success}
 import systems.opalia.commons.codec.Hex
+import systems.opalia.interfaces.cursor.VersatileCursor
 import systems.opalia.interfaces.database._
 import systems.opalia.interfaces.json.JsonAst
 import systems.opalia.interfaces.logging.Logger
 
 
-class Executor(logger: Logger, connection: Connection) {
+class Executor(logger: Logger,
+               connection: Connection,
+               useClosableTransaction: Boolean,
+               closeables: mutable.ListBuffer[OneTimeCloseable]) {
 
-  def execute[R <: Result : ClassTag](clause: String, parameters: Map[String, Any]): R = {
+  def executeAndFetch(statement: String, parameters: Map[String, Any]): Result = {
 
-    val query = DSL.using(connection).parser().parseQuery(clause)
+    val f: (PreparedStatement, Seq[OneTimeCloseable]) => Result =
+      (preparedStatement: PreparedStatement, closeablesLocal: Seq[OneTimeCloseable]) => {
+
+        val metadata = getMetadata(preparedStatement)
+        val underlying = getRowCursor(preparedStatement, metadata)
+
+        val versatileCursor =
+          new VersatileCursor[Row] {
+
+            override def next(): Boolean =
+              underlying.next()
+
+            override def get: Row =
+              underlying.get
+
+            override def close(): Unit = {
+
+              closeablesLocal.foreach(_.close())
+            }
+          }
+
+        new Result {
+
+          val columns: IndexedSeq[String] = metadata.keys.toIndexedSeq
+          val cursor: VersatileCursor[Row] = versatileCursor
+        }
+      }
+
+    performQuery(statement, parameters)(f)
+  }
+
+  def execute(statement: String, parameters: Map[String, Any]): Unit = {
+
+    val f: (PreparedStatement, Seq[OneTimeCloseable]) => Unit =
+      (_: PreparedStatement, closeablesLocal: Seq[OneTimeCloseable]) => {
+
+        closeablesLocal.foreach(_.close())
+      }
+
+    performQuery(statement, parameters)(f)
+  }
+
+  private def performQuery[T](statement: String, parameters: Map[String, Any])
+                             (black: (PreparedStatement, Seq[OneTimeCloseable]) => T): T = {
+
+    val start = System.currentTimeMillis
+    val closeablesLocal = mutable.ListBuffer[OneTimeCloseable]()
 
     try {
 
+      logger.trace(s"Parse dialect free SQL statement:\n$statement")
+
+      val query = DSL.using(connection).parser().parseQuery(statement)
+
+      closeablesLocal.append(new OneTimeCloseable(query))
+
       findBinding(query, parameters)
 
-      val sql = query.getSQL()
+      val statementTranslated = query.getSQL()
 
-      logger.trace(s"Apply dialect specific SQL statement: $sql")
+      logger.debug(s"Apply dialect specific SQL statement:\n$statementTranslated")
 
-      val statement = connection.prepareStatement(sql)
+      val preparedStatement = connection.prepareStatement(statementTranslated)
 
-      try {
+      closeablesLocal.append(new OneTimeCloseable(preparedStatement))
 
-        setValues(statement, query.getBindValues.asScala.toSeq)
+      val arguments = query.getBindValues.asScala.toList
 
-        statement.execute()
+      setValues(preparedStatement, arguments)
 
-        val concreteResult =
-          if (classTag[R] == classTag[IgnoredResult]) {
+      preparedStatement.execute()
 
-            new IgnoredResult {
-            }
+      val result = black(preparedStatement, closeablesLocal.reverse)
 
-          } else {
+      val end = System.currentTimeMillis
 
-            val metadata = getMetadata(statement)
-            val rows = getValues(statement, metadata)
-            val columnNames = metadata.map(x => x._1)
+      if (!useClosableTransaction)
+        logger.trace(s"A SQL statement was performed in ${end - start} ms.")
 
-            if (classTag[R] == classTag[SingleResult]) {
-
-              if (rows.length != 1)
-                throw new IllegalArgumentException(
-                  s"Expect set of rows with cardinality of 1 but ${rows.length} received.")
-
-              new SingleResult {
-
-                def columns: IndexedSeq[String] =
-                  columnNames
-
-                def meta: JsonAst.JsonObject =
-                  JsonAst.JsonObject(ListMap())
-
-                def transform[T](f: Row => T): T =
-                  rows.map(new RowImpl(_)).map(f).head
-              }
-
-            } else if (classTag[R] == classTag[SingleOptResult]) {
-
-              if (rows.length > 1)
-                throw new IllegalArgumentException(
-                  s"Expect set of rows with cardinality of 0 or 1 but ${rows.length} received.")
-
-              new SingleOptResult {
-
-                def columns: IndexedSeq[String] =
-                  columnNames
-
-                def meta: JsonAst.JsonObject =
-                  JsonAst.JsonObject(ListMap())
-
-                def transform[T](f: Row => T): Option[T] =
-                  rows.map(new RowImpl(_)).map(f).headOption
-              }
-
-            } else if (classTag[R] == classTag[IndexedSeqResult]) {
-
-              new IndexedSeqResult {
-
-                def columns: IndexedSeq[String] =
-                  columnNames
-
-                def meta: JsonAst.JsonObject =
-                  JsonAst.JsonObject(ListMap())
-
-                def transform[T](f: Row => T): IndexedSeq[T] =
-                  rows.map(new RowImpl(_)).map(f)
-              }
-
-            } else if (classTag[R] == classTag[IndexedNonEmptySeqResult]) {
-
-              if (rows.isEmpty)
-                throw new IllegalArgumentException(
-                  s"Expect set of rows with cardinality greater than 1 but ${rows.length} received.")
-
-              new IndexedNonEmptySeqResult {
-
-                def columns: IndexedSeq[String] =
-                  columnNames
-
-                def meta: JsonAst.JsonObject =
-                  JsonAst.JsonObject(ListMap())
-
-                def transform[T](f: Row => T): IndexedSeq[T] =
-                  rows.map(new RowImpl(_)).map(f)
-              }
-
-            } else
-              throw new IllegalArgumentException(
-                "Unsupported type of result class.")
-          }
-
-        concreteResult.asInstanceOf[R]
-
-      } finally {
-
-        statement.close()
-      }
+      result
 
     } finally {
 
-      query.close()
+      closeables.appendAll(closeablesLocal.reverse)
     }
   }
 
@@ -139,8 +113,8 @@ class Executor(logger: Logger, connection: Connection) {
 
     new QueryFactory {
 
-      def newQuery(clause: String): Query =
-        new QueryImpl(clause)
+      def newQuery(statement: String): Query =
+        new QueryImpl(statement)
     }
   }
 
@@ -150,18 +124,25 @@ class Executor(logger: Logger, connection: Connection) {
       .foreach {
         case (key, value) =>
 
-          value match {
-            case null => query.bind(key, null)
-            case x: Char => query.bind(key, x.toString)
-            case x: BigDecimal => query.bind(key, x.underlying)
-            case x: LocalDate => query.bind(key, java.sql.Date.valueOf(x))
-            case x: LocalTime => query.bind(key, java.sql.Time.valueOf(x))
-            case x: LocalDateTime => query.bind(key, java.sql.Timestamp.valueOf(x))
-            case x: Seq[_] if (x.forall(_.isInstanceOf[Byte])) =>
-              query.bind(key, x.map(_.asInstanceOf[Byte]).toArray)
-            case x => query.bind(key, x)
-          }
+          findBinding(query, key, value)
       }
+  }
+
+  private def findBinding(query: jooq.Query, key: String, value: Any): Unit = {
+
+    value match {
+      case null => query.bind(key, null)
+      case x: Char => query.bind(key, x.toString)
+      case x: BigDecimal => query.bind(key, x.underlying)
+      case x: LocalDate => query.bind(key, java.sql.Date.valueOf(x))
+      case x: LocalTime => query.bind(key, java.sql.Time.valueOf(x))
+      case x: LocalDateTime => query.bind(key, java.sql.Timestamp.valueOf(x))
+      case x: Seq[_] if (x.forall(_.isInstanceOf[Byte])) => query.bind(key, x.map(_.asInstanceOf[Byte]).toArray)
+      case x: Array[_] if (x.forall(_.isInstanceOf[Byte])) => query.bind(key, x.map(_.asInstanceOf[Byte]))
+      case Some(x) => findBinding(query, key, x)
+      case None => query.bind(key, null)
+      case x => query.bind(key, x)
+    }
   }
 
   private def setValues(statement: PreparedStatement, parameters: Seq[Any]): Unit = {
@@ -171,136 +152,144 @@ class Executor(logger: Logger, connection: Connection) {
       .foreach {
         case (key, value) =>
 
-          value match {
-            case null => statement.setNull(key, JDBCType.NULL.getVendorTypeNumber)
-            case x: Boolean => statement.setBoolean(key, x)
-            case x: Byte => statement.setByte(key, x)
-            case x: Short => statement.setShort(key, x)
-            case x: Integer => statement.setInt(key, x)
-            case x: Long => statement.setLong(key, x)
-            case x: Float => statement.setFloat(key, x)
-            case x: Double => statement.setDouble(key, x)
-            case x: Char => statement.setString(key, x.toString)
-            case x: String => statement.setString(key, x)
-            case x: BigDecimal => statement.setBigDecimal(key, x.underlying)
-            case x: LocalDate => statement.setDate(key, java.sql.Date.valueOf(x))
-            case x: LocalTime => statement.setTime(key, java.sql.Time.valueOf(x))
-            case x: LocalDateTime => statement.setTimestamp(key, java.sql.Timestamp.valueOf(x))
-            case x: java.math.BigDecimal => statement.setBigDecimal(key, x)
-            case x: java.sql.Date => statement.setDate(key, x)
-            case x: java.sql.Time => statement.setTime(key, x)
-            case x: java.sql.Timestamp => statement.setTimestamp(key, x)
-            case x: Seq[_] if (x.forall(_.isInstanceOf[Byte])) =>
-              statement.setBytes(key, x.map(_.asInstanceOf[Byte]).toArray)
-            case x: Array[_] if (x.forall(_.isInstanceOf[Byte])) =>
-              statement.setBytes(key, x.map(_.asInstanceOf[Byte]))
-            case _ =>
-              throw new IllegalArgumentException(
-                s"Cannot put unsupported type with value $value (${value.getClass.getName}) at key $key.")
-          }
+          setValue(statement, key, value)
       }
   }
 
-  private def getValues(statement: PreparedStatement,
-                        metaData: IndexedSeq[(String, JDBCType)]): Vector[ListMap[String, Any]] = {
+  private def setValue(statement: PreparedStatement, key: Int, value: Any): Unit = {
 
-    val result = statement.getResultSet
-    val buffer = mutable.ArrayBuffer[ListMap[String, Any]]()
-
-    if (result != null) {
-
-      while (result.next()) {
-
-        val seq =
-          for (column <- metaData) yield
-            column._1 -> (column._2 match {
-
-              case JDBCType.NULL => null
-
-              case JDBCType.BIT => result.getBoolean(column._1)
-              case JDBCType.BOOLEAN => result.getBoolean(column._1)
-
-              case JDBCType.TINYINT => result.getByte(column._1)
-              case JDBCType.SMALLINT => result.getShort(column._1)
-              case JDBCType.INTEGER => result.getInt(column._1)
-              case JDBCType.BIGINT => result.getLong(column._1)
-
-              case JDBCType.REAL => result.getFloat(column._1)
-              case JDBCType.FLOAT => result.getDouble(column._1)
-              case JDBCType.DOUBLE => result.getDouble(column._1)
-
-              case JDBCType.NUMERIC => BigDecimal(result.getBigDecimal(column._1))
-              case JDBCType.DECIMAL => BigDecimal(result.getBigDecimal(column._1))
-
-              case JDBCType.DATE => result.getDate(column._1).toLocalDate
-              case JDBCType.TIME => result.getTime(column._1).toLocalTime
-              case JDBCType.TIMESTAMP => result.getTimestamp(column._1).toLocalDateTime
-
-              case JDBCType.BINARY => result.getBytes(column._1).toSeq
-              case JDBCType.VARBINARY => result.getBytes(column._1).toSeq
-              case JDBCType.LONGVARBINARY => result.getBytes(column._1).toSeq
-              case JDBCType.BLOB => result.getBytes(column._1)
-
-              case JDBCType.CHAR => result.getString(column._1)
-              case JDBCType.VARCHAR => result.getString(column._1)
-              case JDBCType.LONGVARCHAR => result.getString(column._1)
-              case JDBCType.CLOB => result.getString(column._1)
-
-              case JDBCType.NCHAR => result.getString(column._1)
-              case JDBCType.NVARCHAR => result.getString(column._1)
-              case JDBCType.LONGNVARCHAR => result.getString(column._1)
-              case JDBCType.NCLOB => result.getString(column._1)
-
-              case x =>
-                throw new IllegalArgumentException(
-                  s"Cannot set unsupported JDBC type ${x.getName} for column $column.")
-            })
-
-        buffer += ListMap(seq: _*)
-      }
+    value match {
+      case null => statement.setNull(key, JDBCType.NULL.getVendorTypeNumber)
+      case x: Boolean => statement.setBoolean(key, x)
+      case x: Byte => statement.setByte(key, x)
+      case x: Short => statement.setShort(key, x)
+      case x: Integer => statement.setInt(key, x)
+      case x: Long => statement.setLong(key, x)
+      case x: Float => statement.setFloat(key, x)
+      case x: Double => statement.setDouble(key, x)
+      case x: Char => statement.setString(key, x.toString)
+      case x: String => statement.setString(key, x)
+      case x: BigDecimal => statement.setBigDecimal(key, x.underlying)
+      case x: LocalDate => statement.setDate(key, java.sql.Date.valueOf(x))
+      case x: LocalTime => statement.setTime(key, java.sql.Time.valueOf(x))
+      case x: LocalDateTime => statement.setTimestamp(key, java.sql.Timestamp.valueOf(x))
+      case x: java.math.BigDecimal => statement.setBigDecimal(key, x)
+      case x: java.sql.Date => statement.setDate(key, x)
+      case x: java.sql.Time => statement.setTime(key, x)
+      case x: java.sql.Timestamp => statement.setTimestamp(key, x)
+      case x: Seq[_] if (x.forall(_.isInstanceOf[Byte])) => statement.setBytes(key, x.map(_.asInstanceOf[Byte]).toArray)
+      case x: Array[_] if (x.forall(_.isInstanceOf[Byte])) => statement.setBytes(key, x.map(_.asInstanceOf[Byte]))
+      case Some(x) => setValue(statement, key, x)
+      case None => statement.setNull(key, JDBCType.NULL.getVendorTypeNumber)
+      case _ =>
+        throw new IllegalArgumentException(
+          s"Cannot put unsupported type with value $value (${value.getClass.getName}) at key $key.")
     }
-
-    buffer.toVector
   }
 
-  private def getMetadata(statement: PreparedStatement): Vector[(String, JDBCType)] = {
+  private def getColumnValue(resultSet: ResultSet, columnName: String, jdbcType: JDBCType): Any = {
+
+    jdbcType match {
+
+      case JDBCType.NULL => null
+
+      case JDBCType.BIT => resultSet.getBoolean(columnName)
+      case JDBCType.BOOLEAN => resultSet.getBoolean(columnName)
+
+      case JDBCType.TINYINT => resultSet.getByte(columnName)
+      case JDBCType.SMALLINT => resultSet.getShort(columnName)
+      case JDBCType.INTEGER => resultSet.getInt(columnName)
+      case JDBCType.BIGINT => resultSet.getLong(columnName)
+
+      case JDBCType.REAL => resultSet.getFloat(columnName)
+      case JDBCType.FLOAT => resultSet.getDouble(columnName)
+      case JDBCType.DOUBLE => resultSet.getDouble(columnName)
+
+      case JDBCType.NUMERIC => BigDecimal(resultSet.getBigDecimal(columnName))
+      case JDBCType.DECIMAL => BigDecimal(resultSet.getBigDecimal(columnName))
+
+      case JDBCType.DATE => resultSet.getDate(columnName).toLocalDate
+      case JDBCType.TIME => resultSet.getTime(columnName).toLocalTime
+      case JDBCType.TIMESTAMP => resultSet.getTimestamp(columnName).toLocalDateTime
+
+      case JDBCType.BINARY => resultSet.getBytes(columnName).toSeq
+      case JDBCType.VARBINARY => resultSet.getBytes(columnName).toSeq
+      case JDBCType.LONGVARBINARY => resultSet.getBytes(columnName).toSeq
+      case JDBCType.BLOB => resultSet.getBytes(columnName)
+
+      case JDBCType.CHAR => resultSet.getString(columnName)
+      case JDBCType.VARCHAR => resultSet.getString(columnName)
+      case JDBCType.LONGVARCHAR => resultSet.getString(columnName)
+      case JDBCType.CLOB => resultSet.getString(columnName)
+
+      case JDBCType.NCHAR => resultSet.getString(columnName)
+      case JDBCType.NVARCHAR => resultSet.getString(columnName)
+      case JDBCType.LONGNVARCHAR => resultSet.getString(columnName)
+      case JDBCType.NCLOB => resultSet.getString(columnName)
+
+      case x =>
+        throw new IllegalArgumentException(
+          s"Cannot set unsupported JDBC type ${x.getName} for column $columnName.")
+    }
+  }
+
+  private def getRowCursor(statement: PreparedStatement, metadata: ListMap[String, JDBCType]): VersatileCursor[Row] = {
+
+    val resultSet = statement.getResultSet
+    val row = new RowImpl(resultSet, metadata)
+
+    new VersatileCursor[Row] {
+
+      def next(): Boolean =
+        resultSet.next()
+
+      def get: Row =
+        row
+    }
+  }
+
+  private def getMetadata(statement: PreparedStatement): ListMap[String, JDBCType] = {
 
     val metadata = statement.getMetaData
 
     if (metadata == null)
-      Vector.empty
+      ListMap.empty
     else {
 
-      (for (i <- 1 to metadata.getColumnCount) yield
-        (metadata.getColumnLabel(i).toLowerCase, JDBCType.valueOf(metadata.getColumnType(i)))).toVector
+      val result =
+        ListMap((for (i <- 1 to metadata.getColumnCount) yield
+          (metadata.getColumnLabel(i).toLowerCase, JDBCType.valueOf(metadata.getColumnType(i)))): _*)
+
+      if (result.size != metadata.getColumnCount)
+        throw new IllegalArgumentException("Expect unique column names for resulting rows.")
+
+      result
     }
   }
 
-  private class RowImpl(row: ListMap[String, Any])
+  private class RowImpl(resultSet: ResultSet, metadata: ListMap[String, JDBCType])
     extends Row {
 
-    def apply[T](column: String)(implicit reader: FieldReader[T]): T = {
+    def apply[T](columnName: String)(implicit reader: FieldReader[T]): T = {
 
-      val entry =
-        find(column)
+      val key = columnName.toLowerCase
+
+      val jdbcType =
+        metadata.get(key)
           .map(x => Success(x))
-          .getOrElse(Failure(new IllegalArgumentException(s"Cannot find column $column.")))
+          .getOrElse(Failure(new IllegalArgumentException(s"Cannot find column $columnName.")))
 
       (for {
-        value <- entry
-        result <- reader(column, value)
+        value <- jdbcType
+        result <- reader(columnName, getColumnValue(resultSet, key, value))
       } yield result).get
     }
 
     def toJson: JsonAst.JsonObject =
-      JsonAst.JsonObject(row.map(x => (x._1, transform(x._2))))
+      JsonAst.JsonObject(metadata.map(x => (x._1, transformToJson(getColumnValue(resultSet, x._1, x._2)))))
 
-    private def find(column: String): Option[Any] =
-      row.find(_._1.equalsIgnoreCase(column)).map(_._2)
-
-    private def transform(value: Any): JsonAst.JsonValue =
+    private def transformToJson(value: Any): JsonAst.JsonValue =
       value match {
-
         case null => JsonAst.JsonNull
         case x: Boolean => JsonAst.JsonBoolean(x)
         case x: Byte => JsonAst.JsonNumberByte(x)
@@ -315,26 +304,27 @@ class Executor(logger: Logger, connection: Connection) {
         case x: LocalDate => JsonAst.JsonString(x.toString)
         case x: LocalTime => JsonAst.JsonString(x.toString)
         case x: LocalDateTime => JsonAst.JsonString(x.toString)
-
         case x: Seq[_] if (x.forall(_.isInstanceOf[Byte])) =>
           JsonAst.JsonString(Hex.encode(x.map(_.asInstanceOf[Byte])))
-
         case _ =>
           throw new IllegalArgumentException(
             s"Cannot build JSON AST with value $value (${value.getClass.getName}).")
       }
   }
 
-  private class QueryImpl(clause: String, parameters: Map[String, Any])
+  private class QueryImpl(statement: String, parameters: Map[String, Any])
     extends Query {
 
-    def this(clause: String) =
-      this(clause, Map.empty)
+    def this(statement: String) =
+      this(statement, Map.empty)
 
     def on[T](key: String, value: T)(implicit writer: FieldWriter[T]): Query =
-      new QueryImpl(clause, parameters + (key -> writer(key, value).get))
+      new QueryImpl(statement, parameters + (key -> writer(key, value).get))
 
-    def execute[R <: Result : ClassTag](): R =
-      Executor.this.execute[R](clause, parameters)
+    def executeAndFetch(): Result =
+      Executor.this.executeAndFetch(statement, parameters)
+
+    def execute(): Unit =
+      Executor.this.execute(statement, parameters)
   }
 }

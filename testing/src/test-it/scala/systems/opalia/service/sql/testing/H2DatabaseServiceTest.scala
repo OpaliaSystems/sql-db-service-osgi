@@ -70,7 +70,7 @@ class H2DatabaseServiceTest
 
           factory
             .newQuery(statement)
-            .execute[IgnoredResult]()
+            .execute()
       }
   }
 
@@ -211,10 +211,12 @@ class H2DatabaseServiceTest
             """.stripMargin)
             .on("name_1", "Folker")
             .on("name_2", "Lorelei")
-            .execute[IndexedSeqResult]()
+            .executeAndFetch()
+            .cursor
             .transform(row => row[String]("name"))
+            .toSet
 
-        result.toSet should be(Set("Lorelei", "Berthold"))
+        result should be(Set("Lorelei", "Berthold"))
     }
   }
 
@@ -224,7 +226,7 @@ class H2DatabaseServiceTest
       factory =>
 
         val result1 =
-          factory.newQuery(
+          FileUtils.using(factory.newQuery(
             """
               |SELECT P2.name AS name, P2.counter AS counter
               |FROM _Person P1
@@ -236,11 +238,10 @@ class H2DatabaseServiceTest
               |WHERE P1.name = :name_1
             """.stripMargin)
             .on("name_1", "Armin")
-            .execute[SingleResult]()
-            .transform(row => row.toJson)
+            .executeAndFetch().cursor)(_.transform(row => row.toJson).toSingle)
 
         val result2 =
-          factory.newQuery(
+          FileUtils.using(factory.newQuery(
             """
               |SELECT R2.name AS name, R2.friend AS friend
               |FROM _Person P1
@@ -254,8 +255,7 @@ class H2DatabaseServiceTest
               |INNER JOIN _Relationship R2 ON R2.name = 'KNOWS' AND
               |((P1.id = R2.person1_id AND P2.id = R2.person2_id) OR (P1.id = R2.person2_id AND P2.id = R2.person1_id))
             """.stripMargin)
-            .execute[SingleResult]()
-            .transform(row => row.toJson)
+            .executeAndFetch().cursor)(_.transform(row => row.toJson).toSingle)
 
         JsonAstTransformer.toPlayJson(result1) should be(
           Json.obj("name" -> "Lorelei", "counter" -> 88)
@@ -272,7 +272,7 @@ class H2DatabaseServiceTest
     transactional.withTransaction {
       factory =>
 
-        val result1 =
+        val query1 =
           factory.newQuery(
             """
               |SELECT P1.name AS name, P1.counter AS counter
@@ -282,9 +282,8 @@ class H2DatabaseServiceTest
               |WHERE P1.name = :name_1
             """.stripMargin)
             .on("name_1", "Dagmar")
-            .execute[SingleOptResult]()
 
-        val result2 =
+        val query2 =
           factory.newQuery(
             """
               |SELECT P1.name AS name, P1.counter AS counter
@@ -294,9 +293,8 @@ class H2DatabaseServiceTest
               |WHERE P1.name = :name_1
             """.stripMargin)
             .on("name_1", Some("Dagmar"))
-            .execute[SingleOptResult]()
 
-        val result3 =
+        val query3 =
           factory.newQuery(
             """
               |SELECT P1.name AS name, P1.counter AS counter
@@ -306,9 +304,8 @@ class H2DatabaseServiceTest
               |WHERE P1.name = :name_1
             """.stripMargin)
             .on("name_1", None)
-            .execute[SingleOptResult]()
 
-        val result4 =
+        val query4 =
           factory.newQuery(
             """
               |SELECT P1.name AS name, P1.extra AS extra
@@ -318,7 +315,7 @@ class H2DatabaseServiceTest
               |WHERE P1.name = :name_1
             """.stripMargin)
             .on("name_1", "Dagmar")
-            .execute[SingleOptResult]()
+
 
         val transformer1 =
           (row: Row) => (row[String]("name"), row[Option[Int]]("counter"))
@@ -332,18 +329,18 @@ class H2DatabaseServiceTest
         val transformer4 =
           (row: Row) => (row[String]("name"), row[String]("extra"))
 
-        result1.transform(transformer1) shouldBe Some("Dagmar", Some(73))
-        result1.transform(transformer2) shouldBe Some("Dagmar", None)
+        query1.executeAndFetch().cursor.transform(transformer1).toSingleOpt shouldBe Some("Dagmar", Some(73))
+        query1.executeAndFetch().cursor.transform(transformer2).toSingleOpt shouldBe Some("Dagmar", None)
 
-        result2.transform(transformer1) shouldBe Some("Dagmar", Some(73))
-        result2.transform(transformer2) shouldBe Some("Dagmar", None)
+        query2.executeAndFetch().cursor.transform(transformer1).toSingleOpt shouldBe Some("Dagmar", Some(73))
+        query2.executeAndFetch().cursor.transform(transformer2).toSingleOpt shouldBe Some("Dagmar", None)
 
-        result3.transform(transformer1) shouldBe None
-        result3.transform(transformer2) shouldBe None
+        query3.executeAndFetch().cursor.transform(transformer1).toSingleOpt shouldBe None
+        query3.executeAndFetch().cursor.transform(transformer2).toSingleOpt shouldBe None
 
-        result4.transform(transformer3) shouldBe Some("Dagmar", None)
+        query4.executeAndFetch().cursor.transform(transformer3).toSingleOpt shouldBe Some("Dagmar", None)
 
-        an[IllegalArgumentException] should be thrownBy result4.transform(transformer4)
+        an[IllegalArgumentException] should be thrownBy query4.executeAndFetch().cursor.transform(transformer4).toSingleOpt
     }
   }
 
@@ -389,38 +386,62 @@ class H2DatabaseServiceTest
         // single
 
         an[IllegalArgumentException] should be thrownBy
-          queryExpectEmpty.execute[SingleResult]().transform(transformer)
+          FileUtils.using(queryExpectEmpty.executeAndFetch().cursor)(
+            _.transform(transformer).toSingle
+          )
 
-        queryExpectOne.execute[SingleResult]().transform(transformer) shouldBe a[String]
+        FileUtils.using(queryExpectOne.executeAndFetch().cursor)(
+          _.transform(transformer).toSingle
+        ) shouldBe a[String]
 
         an[IllegalArgumentException] should be thrownBy
-          queryExpectMultiple.execute[SingleResult]().transform(transformer)
+          FileUtils.using(queryExpectMultiple.executeAndFetch().cursor)(
+            _.transform(transformer).toSingle
+          )
 
         // single optional
 
-        queryExpectEmpty.execute[SingleOptResult]().transform(transformer) shouldBe empty
+        FileUtils.using(queryExpectEmpty.executeAndFetch().cursor)(
+          _.transform(transformer).toSingleOpt
+        ) shouldBe empty
 
-        queryExpectOne.execute[SingleOptResult]().transform(transformer) shouldBe defined
+        FileUtils.using(queryExpectOne.executeAndFetch().cursor)(
+          _.transform(transformer).toSingleOpt
+        ) shouldBe defined
 
         an[IllegalArgumentException] should be thrownBy
-          queryExpectMultiple.execute[SingleOptResult]().transform(transformer)
+          FileUtils.using(queryExpectMultiple.executeAndFetch().cursor)(
+            _.transform(transformer).toSingleOpt
+          )
 
         // sequence
 
-        queryExpectEmpty.execute[IndexedSeqResult]().transform(transformer) should have size 0
+        FileUtils.using(queryExpectEmpty.executeAndFetch().cursor)(
+          _.transform(transformer).toIndexedSeq
+        ) should have size 0
 
-        queryExpectOne.execute[IndexedSeqResult]().transform(transformer) should have size 1
+        FileUtils.using(queryExpectOne.executeAndFetch().cursor)(
+          _.transform(transformer).toIndexedSeq
+        ) should have size 1
 
-        queryExpectMultiple.execute[IndexedSeqResult]().transform(transformer) should have size 4
+        FileUtils.using(queryExpectMultiple.executeAndFetch().cursor)(
+          _.transform(transformer).toIndexedSeq
+        ) should have size 4
 
         // non empty sequence
 
         an[IllegalArgumentException] should be thrownBy
-          queryExpectEmpty.execute[IndexedNonEmptySeqResult]().transform(transformer)
+          FileUtils.using(queryExpectEmpty.executeAndFetch().cursor)(
+            _.transform(transformer).toNonEmptyIndexedSeq
+          )
 
-        queryExpectOne.execute[IndexedNonEmptySeqResult]().transform(transformer) should have size 1
+        FileUtils.using(queryExpectOne.executeAndFetch().cursor)(
+          _.transform(transformer).toNonEmptyIndexedSeq
+        ) should have size 1
 
-        queryExpectMultiple.execute[IndexedNonEmptySeqResult]().transform(transformer) should have size 4
+        FileUtils.using(queryExpectMultiple.executeAndFetch().cursor)(
+          _.transform(transformer).toNonEmptyIndexedSeq
+        ) should have size 4
     }
   }
 
@@ -463,33 +484,33 @@ class H2DatabaseServiceTest
           .on("12", localTime)
           .on("13", localDateTime)
           .on("14", binary)
-          .execute[IgnoredResult]()
+          .execute()
 
         val result =
-          factory.newQuery(
+          FileUtils.using(factory.newQuery(
             """
               |SELECT *
               |FROM _Values
             """.stripMargin)
-            .execute[SingleResult]()
-            .transform {
-              row =>
+            .executeAndFetch().cursor)(_.transform {
+            row =>
 
-                (row[Boolean]("val_boolean"),
-                  row[Byte]("val_byte"),
-                  row[Short]("val_short"),
-                  row[Int]("val_int"),
-                  row[Long]("val_long"),
-                  row[Float]("val_float"),
-                  row[Double]("val_double"),
-                  row[Char]("val_char"),
-                  row[String]("val_string"),
-                  row[BigDecimal]("val_bigDecimal"),
-                  row[LocalDate]("val_localDate"),
-                  row[LocalTime]("val_localTime"),
-                  row[LocalDateTime]("val_localDateTime"),
-                  row[Seq[Byte]]("val_binary"))
-            }
+              (row[Boolean]("val_boolean"),
+                row[Byte]("val_byte"),
+                row[Short]("val_short"),
+                row[Int]("val_int"),
+                row[Long]("val_long"),
+                row[Float]("val_float"),
+                row[Double]("val_double"),
+                row[Char]("val_char"),
+                row[String]("val_string"),
+                row[BigDecimal]("val_bigDecimal"),
+                row[LocalDate]("val_localDate"),
+                row[LocalTime]("val_localTime"),
+                row[LocalDateTime]("val_localDateTime"),
+                row[Seq[Byte]]("val_binary"))
+
+          }.toSingle)
 
         result._1 should be(boolean)
         result._2 should be(byte)
@@ -506,6 +527,35 @@ class H2DatabaseServiceTest
         result._12 should be(localTime)
         result._13 should be(localDateTime)
         result._14 should be(binary)
+    }
+  }
+
+  it should "should support transactions with unspecific lifetime" in {
+
+    FileUtils.using(transactional.createClosableTransaction()) {
+      transaction =>
+
+        val result =
+          transaction.queryFactory.newQuery(
+            """
+              |SELECT P2.name AS name
+              |FROM _Person P1
+              |CROSS JOIN _Person P2
+              |INNER JOIN _Membership M1 ON P1.id = M1.person_id
+              |INNER JOIN _Group G1 ON M1.group_id = G1.id AND G1.name = 'Group1'
+              |INNER JOIN _Membership M2 ON P2.id = M2.person_id
+              |INNER JOIN _Group G2 ON M2.group_id = G2.id AND G2.name = 'Group1'
+              |INNER JOIN _Relationship R1 ON P1.id = R1.person1_id AND P2.id = R1.person2_id AND R1.name = 'KNOWS'
+              |WHERE P1.name = :name_1 or P1.name = :name_2
+            """.stripMargin)
+            .on("name_1", "Folker")
+            .on("name_2", "Lorelei")
+            .executeAndFetch()
+            .cursor
+            .transform(row => row[String]("name"))
+            .toSet
+
+        result should be(Set("Lorelei", "Berthold"))
     }
   }
 }
