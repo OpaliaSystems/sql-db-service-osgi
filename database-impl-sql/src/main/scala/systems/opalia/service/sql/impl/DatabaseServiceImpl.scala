@@ -10,7 +10,7 @@ import systems.opalia.interfaces.soa.ConfigurationService
 import systems.opalia.interfaces.soa.osgi.ServiceManager
 
 
-@Component(service = Array(classOf[DatabaseService]), immediate = true)
+@Component(service = Array(classOf[DatabaseService]), immediate = true, property = Array("database=sql"))
 class DatabaseServiceImpl
   extends DatabaseService {
 

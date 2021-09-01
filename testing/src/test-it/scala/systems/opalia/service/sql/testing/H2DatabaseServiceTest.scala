@@ -7,6 +7,7 @@ import org.scalatest.flatspec._
 import org.scalatest.matchers.should._
 import org.scalatest.{BeforeAndAfterAll, BeforeAndAfterEach}
 import play.api.libs.json.Json
+import scala.collection.JavaConverters._
 import scala.concurrent.Await
 import scala.concurrent.duration.Duration
 import systems.opalia.bootloader.ArtifactNameBuilder._
@@ -69,7 +70,7 @@ class H2DatabaseServiceTest
 
     Await.result(bootloader.awaitUp(), Duration.Inf)
 
-    transactional = serviceManager.getService(bootloader.bundleContext, classOf[DatabaseService])
+    transactional = serviceManager.getServices(bootloader.bundleContext, classOf[DatabaseService], "(database=sql)").asScala.head
   }
 
   override final def afterAll(): Unit = {
